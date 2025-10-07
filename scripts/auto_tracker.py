@@ -6,7 +6,7 @@ from tracker import track_price
 def check_all_products():
     print(f"\n🕒 Checking prices at {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    with open('products.csv', newline='', encoding='utf-8') as csvfile:
+    with open('app/products.csv', newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             name = row['product_name']

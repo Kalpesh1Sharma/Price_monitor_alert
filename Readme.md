@@ -84,22 +84,27 @@ A full-stack Python project that tracks product prices (e.g., Flipkart/Amazon), 
 ```bash
 git clone https://github.com/your-username/price-monitor.git
 cd price-monitor
+```
 
-2. **Install dependencies**
+2. **Install dependencies** 
+```bash
 pip install -r requirements.txt
-
+```
 3. **Create .env**
+```bash
 BOT_TOKEN=your_telegram_bot_token
 CHAT_ID=your_telegram_chat_id
-
+```
 4. **Add products to products.csv**
 
 5. **Run Tracker**
+```bash
 python auto_tracker.py
-
+```
 6. **Run Dashboard**
+```bash
 streamlit run dashboard.py
-
+```
 ## 🛡️ Security Notes
 
 - 🔒 Never commit your `.env` file to GitHub. It contains sensitive data like your Telegram bot token and chat ID.
@@ -129,3 +134,4 @@ _Data Engineer & Automation Enthusiast_
 ---
 
 > If you liked this project, don’t forget to ⭐ star the repo and share it with others!
+

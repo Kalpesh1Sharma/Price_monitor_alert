@@ -9,7 +9,7 @@ st.title("🛒 Real-Time Price Tracker")
 st.caption("Track products, price drops, and alerts.")
 
 # Connect to SQLite DB
-conn = sqlite3.connect("price_tracker.db")
+conn = sqlite3.connect("app/price_tracker.db")
 query = """
 SELECT 
     product_name,

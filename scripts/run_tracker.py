@@ -2,7 +2,7 @@ import csv
 from tracker import track_price
 
 # Flipkart product URL
-with open('products.csv', newline='', encoding='utf-8') as csvfile:
+with open('app/products.csv', newline='', encoding='utf-8') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         name = row['product_name']

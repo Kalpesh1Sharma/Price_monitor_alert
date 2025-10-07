@@ -1,7 +1,7 @@
 import sqlite3
 
 def create_db():
-    conn = sqlite3.connect('price_tracker.db')
+    conn = sqlite3.connect('app/price_tracker.db')
     c = conn.cursor()
 
     c.execute('''

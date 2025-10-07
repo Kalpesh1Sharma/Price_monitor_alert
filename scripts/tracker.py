@@ -1,4 +1,4 @@
-from scraper import get_flipkart_price
+from scripts.scraper import get_flipkart_price
 import sqlite3
 import datetime
 import requests

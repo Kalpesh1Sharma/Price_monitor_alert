@@ -1,7 +1,9 @@
 import csv
 import schedule
 import time
-from tracker import track_price
+from scripts.tracker import track_price
+
+
 
 def check_all_products():
     print(f"\n🕒 Checking prices at {time.strftime('%Y-%m-%d %H:%M:%S')}")

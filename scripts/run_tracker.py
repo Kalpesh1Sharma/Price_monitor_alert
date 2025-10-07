@@ -1,5 +1,5 @@
 import csv
-from tracker import track_price
+from scripts.tracker import track_price
 
 # Flipkart product URL
 with open('app/products.csv', newline='', encoding='utf-8') as csvfile:

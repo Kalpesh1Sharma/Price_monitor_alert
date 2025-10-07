@@ -133,5 +133,5 @@ _Data Engineer & Automation Enthusiast_
 
 ---
 
-> If you liked this project, don’t forget to ⭐ star the repo and share it with others!
+
 

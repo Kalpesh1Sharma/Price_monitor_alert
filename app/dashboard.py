@@ -1,85 +1,75 @@
-# app/dashboard.py  (add or integrate into your existing file)
-import sqlite3
-import os
-import time
-from urllib.parse import urlparse
-
+import re
 import requests
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-import streamlit as st
 
-DB_PATH = os.environ.get("TRACKER_DB", "tracked.db")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-# --- DB helper (simple SQLite) ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS tracked_products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL,
-        title TEXT,
-        target_price REAL,
-        last_price REAL,
-        last_checked TIMESTAMP
-    )
-    """)
-    conn.commit()
-    conn.close()
+def parse_price_string(price_str):
+    if not price_str:
+        return None
+    cleaned = re.sub(r"[^\d.,]", "", price_str)
+    cleaned = cleaned.replace(",", "")
+    try:
+        return float(cleaned)
+    except:
+        return None
 
-def add_tracked_product(url, title, target_price, last_price=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO tracked_products (url, title, target_price, last_price, last_checked) VALUES (?, ?, ?, ?, ?)",
-              (url, title, target_price, last_price, None))
-    conn.commit()
-    conn.close()
+def fetch_product(url):
+    domain = urlparse(url).netloc.lower()
 
-# --- existing fetch_product / parse functions here ---
-# re-use your existing fetch_product implementation from earlier message
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        return None, None, None, f"Request failed: {e}"
 
-# Initialize DB
-init_db()
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
 
-st.title("🔎 Price Checker & Tracker")
+    # AMAZON
+    if "amazon" in domain:
+        title = soup.select_one("#productTitle")
+        title = title.get_text(strip=True) if title else None
 
-url = st.text_input("Product URL", placeholder="https://www.amazon.in/.... or https://www.flipkart.com/....")
-target_price = st.text_input("Target price (₹) — enter numbers only", value="")
-check_now = st.button("Check price")
-track_now = st.button("Track this product")
+        price = soup.select_one("span.a-price span.a-offscreen")
+        price = price.get_text(strip=True) if price else None
 
-if check_now:
-    if not url:
-        st.error("Paste a product URL first.")
-    else:
-        title, price, img, error = fetch_product(url)
-        if error:
-            st.error(error)
-        else:
-            if title:
-                st.subheader(title)
-            if img:
-                st.image(img, width=300)
-            if price is not None:
-                st.metric(label="Current price (approx.)", value=f"₹ {price:,.2f}")
-            else:
-                st.warning("Couldn't detect price automatically. Try another URL.")
+        img = soup.select_one("#landingImage")
+        img = img["src"] if img else None
 
-# When user clicks "Track this product"
-if track_now:
-    if not url:
-        st.error("Paste a product URL first.")
-    else:
-        # fetch to get title/price
-        title, price, img, error = fetch_product(url)
-        if error:
-            st.error(f"Cannot fetch product: {error}")
-        else:
-            # validate target_price as float
-            try:
-                tp = float(target_price.replace(",", "").strip())
-            except Exception:
-                st.error("Enter a valid target price (just numbers, e.g., 1299.50).")
-            else:
-                add_tracked_product(url, title or "", tp, price)
-                st.success(f"Tracking saved for: {title or url}\nTarget price: ₹ {tp:,.2f}")
+        return title, parse_price_string(price), img, None
+
+    # FLIPKART
+    if "flipkart" in domain:
+        title = soup.select_one("span.B_NuCI")
+        title = title.get_text(strip=True) if title else None
+
+        price = soup.select_one("div._30jeq3._16Jk6d")
+        price = price.get_text(strip=True) if price else None
+
+        img = soup.select_one("img._2r_T1I")
+        img = img["src"] if img else None
+
+        return title, parse_price_string(price), img, None
+
+    # GENERIC WEBSITE
+    title = soup.select_one("meta[property='og:title']") or soup.select_one("title")
+    if title:
+        title = title.get("content") if title.has_attr("content") else title.get_text()
+
+    price = soup.select_one("meta[property='product:price:amount']")
+
+    price = price.get("content") if price and price.has_attr("content") else None
+
+    img = soup.select_one("meta[property='og:image']")
+    img = img.get("content") if img and img.has_attr("content") else None
+
+    return title, parse_price_string(price), img, None

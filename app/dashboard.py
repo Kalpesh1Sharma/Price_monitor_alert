@@ -15,8 +15,8 @@ ALERT_COOLDOWN = 86400 # 24 Hours before alerting again for the same item
 
 # --- TELEGRAM CONFIG ---
 # Replace with your details
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE" 
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
+    TELEGRAM_CHAT_ID = st.secrets["telegram_chat_id"]
 
 # --- Database Engine ---
 def get_db_connection():

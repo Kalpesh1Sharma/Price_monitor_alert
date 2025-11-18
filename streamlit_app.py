@@ -10,12 +10,16 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
+# --- CRITICAL CONCURRENCY LOCK ---
+# This ensures that only one thread (poller or UI) can access the database file at a time.
+DB_LOCK = threading.Lock()
+
 # --- CONFIGURATION ---
 DB_FILE = "prices.db"
-POLL_INTERVAL = 1800 
-ALERT_COOLDOWN = 43200 
+POLL_INTERVAL = 1800  # 30 minutes
+ALERT_COOLDOWN = 43200 # 12 hours
 
-# --- SECRETS MANAGEMENT (CRASH-PROOF) ---
+# --- SECRETS MANAGEMENT (Crash-Proof) ---
 TELEGRAM_BOT_TOKEN = None
 TELEGRAM_CHAT_ID = None
 
@@ -28,41 +32,43 @@ try:
             TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
         if "telegram_chat_id" in st.secrets:
             TELEGRAM_CHAT_ID = st.secrets["telegram_chat_id"]
-except Exception as e:
-    print(f"Secrets Error (Non-fatal): {e}")
+except Exception:
+    pass
 
 # --- Database Engine ---
 def get_db_connection():
+    # Connection is opened without the lock here, but transactions must use the lock.
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initialize DB. Removed WAL mode for Cloud Stability."""
+    """Initializes DB and ensures tables exist."""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        # Note: Removed WAL mode to prevent file locking on Streamlit Cloud
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS items 
-                     (id TEXT PRIMARY KEY, name TEXT, url TEXT, target_price REAL DEFAULT 0, last_alert_at REAL DEFAULT 0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS prices 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, checked_at REAL, price REAL, status TEXT)''')
-        
-        # Migration Check
-        try:
-            cols = [row[1] for row in c.execute("PRAGMA table_info(items)")]
-            if 'target_price' not in cols: c.execute('ALTER TABLE items ADD COLUMN target_price REAL DEFAULT 0')
-            if 'last_alert_at' not in cols: c.execute('ALTER TABLE items ADD COLUMN last_alert_at REAL DEFAULT 0')
-        except:
-            pass
+        with DB_LOCK:
+            conn = get_db_connection()
+            c = conn.cursor()
             
-        conn.commit()
-        conn.close()
+            c.execute('''CREATE TABLE IF NOT EXISTS items 
+                         (id TEXT PRIMARY KEY, name TEXT, url TEXT, target_price REAL DEFAULT 0, last_alert_at REAL DEFAULT 0)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS prices 
+                         (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, checked_at REAL, price REAL, status TEXT)''')
+            
+            # Migration safety
+            try:
+                cols = [row[1] for row in c.execute("PRAGMA table_info(items)")]
+                if 'target_price' not in cols: c.execute('ALTER TABLE items ADD COLUMN target_price REAL DEFAULT 0')
+                if 'last_alert_at' not in cols: c.execute('ALTER TABLE items ADD COLUMN last_alert_at REAL DEFAULT 0')
+            except:
+                pass
+                
+            conn.commit()
+            conn.close()
     except Exception as e:
-        st.error(f"Database Initialization Failed: {e}")
+        # If DB initialization fails (e.g., bad permissions), log it.
+        print(f"FATAL: Database Initialization Failed: {e}")
 
-# --- Scraping Logic ---
+# --- Scraping & Telegram Logic ---
 def get_random_headers():
     try:
         ua = UserAgent()
@@ -101,7 +107,7 @@ def fetch_price_data(url):
         if "amazon" in url:
             price = parse_price_amazon(soup)
         else:
-            # Generic Fallback
+            # Generic Fallback (Simple regex)
             import re
             text = soup.get_text()
             matches = re.findall(r'[₹$]\s?([\d,]+)', text)
@@ -110,9 +116,8 @@ def fetch_price_data(url):
         if price: return price, "Success"
         return None, "Parse Fail"
     except Exception as e:
-        return None, "Error"
+        return None, f"Request Error: {e}"
 
-# --- Telegram ---
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False, "No Config"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -123,38 +128,56 @@ def send_telegram_message(text):
     except Exception as e:
         return False, str(e)
 
-# --- Worker ---
+# --- Worker Logic ---
 def check_item_logic(item_id, name, url, target_price, last_alert):
     price, status = fetch_price_data(url)
     now = time.time()
-    conn = get_db_connection()
-    conn.execute('INSERT INTO prices (item_id, checked_at, price, status) VALUES (?,?,?,?)',
-                 (item_id, now, price if price else -1, status))
     
-    if price and price > 0 and target_price > 0 and price <= target_price:
-        if (now - last_alert) > ALERT_COOLDOWN:
-            msg = f"🚨 **DEAL ALERT!**\n\n📦 {name}\n💰 **Current:** ₹{price}\n🎯 **Target:** ₹{target_price}\n\n[Link]({url})"
-            send_telegram_message(msg)
-            conn.execute('UPDATE items SET last_alert_at = ? WHERE id = ?', (now, item_id))
-    conn.commit()
-    conn.close()
+    conn = get_db_connection()
+    try:
+        with DB_LOCK:
+            # 1. Insert Price Snapshot
+            conn.execute('INSERT INTO prices (item_id, checked_at, price, status) VALUES (?,?,?,?)',
+                         (item_id, now, price if price else -1, status))
+            
+            # 2. Alerting Logic
+            if price and price > 0 and target_price > 0 and price <= target_price:
+                if (now - last_alert) > ALERT_COOLDOWN:
+                    msg = f"🚨 **DEAL ALERT!**\n\n📦 {name}\n💰 **Current:** ₹{price}\n🎯 **Target:** ₹{target_price}\n\n[Link]({url})"
+                    success, err = send_telegram_message(msg)
+                    if success:
+                        conn.execute('UPDATE items SET last_alert_at = ? WHERE id = ?', (now, item_id))
+                    else:
+                        print(f"Alert failed for {name}: {err}")
+            
+            conn.commit()
+    except Exception as e:
+        print(f"DB Write Error in Poller for {name}: {e}")
+    finally:
+        conn.close()
     return price, status
 
+# --- Background Thread ---
 @st.cache_resource
 def start_poller():
     def run():
         while True:
             try:
-                conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                items = conn.execute('SELECT * FROM items').fetchall()
-                conn.close()
+                # Read items (must use lock as well)
+                with DB_LOCK:
+                    conn = get_db_connection()
+                    conn.row_factory = sqlite3.Row
+                    items = conn.execute('SELECT * FROM items').fetchall()
+                    conn.close()
+                
                 for row in items:
                     check_item_logic(row['id'], row['name'], row['url'], row['target_price'], row['last_alert_at'])
-                    time.sleep(10)
-            except:
-                pass
+                    time.sleep(10) # Be polite to the vendor
+            except Exception as e:
+                print(f"Poller Loop Failed: {e}")
+                
             time.sleep(POLL_INTERVAL)
+            
     t = threading.Thread(target=run, daemon=True)
     t.start()
 
@@ -166,77 +189,98 @@ def main():
     
     st.title("☁️ Cloud Price Tracker")
 
-    # Sidebar
+    # --- Sidebar ---
     with st.sidebar:
         st.header("Add Item")
         with st.form("new_item"):
+            name = st.text_input("Product Name (Optional)")
             url = st.text_input("URL")
-            target = st.number_input("Target Price", min_value=0.0)
+            target = st.number_input("Target Price (₹)", min_value=0.0)
+            
             if st.form_submit_button("Track"):
                 if url:
-                    conn = get_db_connection()
-                    uid = str(uuid.uuid4())
-                    conn.execute("INSERT INTO items (id, name, url, target_price) VALUES (?,?,?,?)", 
-                                 (uid, "New Item", url, target))
-                    conn.commit()
-                    conn.close()
-                    st.success("Added")
-                    time.sleep(1)
-                    st.rerun()
+                    # Logic to insert the new item (Must use lock!)
+                    item_name = name or url[:30]
+                    try:
+                        with DB_LOCK:
+                            conn = get_db_connection()
+                            uid = str(uuid.uuid4())
+                            conn.execute("INSERT INTO items (id, name, url, target_price) VALUES (?,?,?,?)", 
+                                         (uid, item_name, url, target))
+                            conn.commit()
+                            conn.close()
+                        st.success(f"Added: {item_name}")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to insert item (DB Write Error): {e}") # <-- Shows the explicit error
         
         st.divider()
         if st.button("Test Telegram"):
-            ok, msg = send_telegram_message("✅ Test from App")
+            ok, msg = send_telegram_message("✅ Test message from App")
             if ok: st.success("Sent!")
             else: st.error(f"Failed: {msg}")
 
-    # Dashboard Data Loading (With Error Handling)
+    # --- Dashboard Data Loading ---
+    df = pd.DataFrame()
     try:
-        conn = get_db_connection()
-        df = pd.read_sql('''
-            SELECT i.id, i.name, i.url, i.target_price, 
-                   p.price as current_price, p.status, p.checked_at
-            FROM items i
-            LEFT JOIN (
-                SELECT item_id, price, status, checked_at FROM prices 
-                WHERE id IN (SELECT MAX(id) FROM prices GROUP BY item_id)
-            ) p ON i.id = p.item_id
-        ''', conn)
-        conn.close()
-    except Exception as e:
-        st.warning("Database is initializing or empty. Add an item to start.")
-        df = pd.DataFrame()
+        # Load data (Must use lock!)
+        with DB_LOCK:
+            conn = get_db_connection()
+            df = pd.read_sql('''
+                SELECT i.id, i.name, i.url, i.target_price, 
+                       p.price as current_price, p.status, p.checked_at
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, price, status, checked_at FROM prices 
+                    WHERE id IN (SELECT MAX(id) FROM prices GROUP BY item_id)
+                ) p ON i.id = p.item_id
+            ''', conn)
+            conn.close()
+    except Exception:
+        # This catches the initial "no such table" error before init_db runs perfectly
+        pass
 
+    # --- Display ---
     if not df.empty:
         for _, row in df.iterrows():
             price = row['current_price']
             target = row['target_price']
             status = row['status'] if row['status'] else "Pending"
             
-            color = "grey"
-            if status != "Success": icon = "⚠️"
-            elif price and target and price <= target: 
-                color = "green"
+            # Status display logic
+            if status != "Success" or not price:
+                icon = "⚠️"
+                lbl = f"Status: {status}"
+            elif price <= target and target > 0:
                 icon = "🔥"
-            else: 
-                color = "red"
+                lbl = f"DEAL! (₹{price})"
+            else:
                 icon = "📈"
+                lbl = f"Current: ₹{price}"
 
-            lbl = f"₹{price}" if price and price > 0 else status
-            
             with st.expander(f"{icon} {lbl} | Target: ₹{target} | {row['url'][:40]}...", expanded=True):
                 c1, c2 = st.columns(2)
                 c1.markdown(f"[Link]({row['url']})")
+                
+                # Manual Check
                 if c1.button("Check Now", key=f"chk_{row['id']}"):
                     with st.spinner("Checking..."):
                         check_item_logic(row['id'], row['name'], row['url'], row['target_price'], 0)
                     st.rerun()
+                
+                # Delete Item
                 if c2.button("Delete", key=f"del_{row['id']}"):
-                    conn = get_db_connection()
-                    conn.execute("DELETE FROM items WHERE id=?", (row['id'],))
-                    conn.commit()
-                    conn.close()
-                    st.rerun()
+                    try:
+                        with DB_LOCK:
+                            conn = get_db_connection()
+                            conn.execute("DELETE FROM items WHERE id=?", (row['id'],))
+                            conn.execute("DELETE FROM prices WHERE item_id=?", (row['id'],))
+                            conn.commit()
+                            conn.close()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Deletion Failed: {e}")
     else:
         st.info("Watchlist is empty. Add an item in the sidebar.")
 

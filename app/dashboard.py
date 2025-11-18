@@ -37,7 +37,6 @@ except Exception:
 # --- Database Path Management ---
 def get_db_path():
     """Returns a reliable path for the SQLite file in the OS temporary directory (/tmp)."""
-    # Using /tmp ensures the file is created in a guaranteed writable location on Linux/Cloud systems.
     return os.path.join("/tmp", "prices.db") 
 
 def get_db_connection():
@@ -55,11 +54,9 @@ def init_db():
         try:
             with DB_LOCK:
                 conn = get_db_connection()
-                # Simple check to see if the main table exists and is readable.
                 conn.execute("SELECT name FROM items LIMIT 1").fetchone()
                 conn.close()
         except Exception:
-            # If the database file is locked or corrupt, delete it to force a clean start.
             print("DB file found but appears corrupted/locked. Deleting and recreating.")
             os.remove(db_path)
             
@@ -165,7 +162,7 @@ def check_item_logic(item_id, name, url, target_price, last_alert):
                     if success:
                         conn.execute('UPDATE items SET last_alert_at = ? WHERE id = ?', (now, item_id))
                     else:
-                        print(f"Alert failed for {name}: {err}") # Log error for debugging
+                        print(f"Alert failed for {name}: {err}")
             
             conn.commit()
     except Exception as e:
@@ -255,7 +252,6 @@ def main():
             ''', conn)
             conn.close()
     except Exception as e:
-        # This catches the initial "no such table" error before init_db runs perfectly
         print(f"Main data load failed: {e}")
         st.warning("Database is initializing or empty. Add an item to start.")
         df = pd.DataFrame() 
@@ -266,24 +262,32 @@ def main():
             price = row['current_price']
             target = row['target_price']
             status = row['status'] if row['status'] else "Pending"
-            
-            # Status display logic
-            last_checked_str = datetime.fromtimestamp(row['checked_at']).strftime('%Y-%m-%d %H:%M') if row['checked_at'] else 'Never'
+            last_checked_ts = row['checked_at']
 
-            if status != "Success" or not price:
+            # 1. Safely determine display values and status (FIX FOR TYPE ERROR)
+            if price is None or price <= 0:
+                price_display = "Pending/Error"
+                price_float = 0.0
                 icon = "⚠️"
-                lbl = f"Status: {status}"
-            elif price <= target and target > 0:
-                icon = "🔥"
-                lbl = f"DEAL! (₹{price:.2f})"
+                lbl = "Status: Pending"
             else:
-                icon = "📈"
-                lbl = f"Current: ₹{price:.2f}"
+                # Use safe string formatting only when price is a valid number
+                price_display = f"₹{price:.2f}"
+                price_float = price
+                if price <= target and target > 0:
+                    icon = "🔥"
+                    lbl = f"DEAL! ({price_display})"
+                else:
+                    icon = "📈"
+                    lbl = f"Current: {price_display}"
+            
+            last_checked_str = datetime.fromtimestamp(last_checked_ts).strftime('%Y-%m-%d %H:%M') if last_checked_ts else 'Never'
 
+            # 2. Expander Display (Using the safe strings)
             with st.expander(f"{icon} {lbl} | Target: ₹{target:.2f} | {row['url'][:40]}...", expanded=True):
                 
-                # --- NEW: Explicit Display of Price/Target ---
-                st.markdown(f"**Current Price:** ₹{price:.2f} (Checked: {last_checked_str})")
+                # --- FIX APPLIED HERE: Safe string output ---
+                st.markdown(f"**Current Price:** {price_display} (Checked: {last_checked_str})")
                 st.markdown(f"**Target Price:** ₹{target:.2f}")
                 st.markdown(f"**Status:** {status}")
                 

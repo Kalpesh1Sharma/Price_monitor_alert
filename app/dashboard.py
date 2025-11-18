@@ -1,6 +1,19 @@
 # --- Telegram & debug panel (paste inside your Streamlit app) ---
-st.markdown("---")
-st.header("🔧 Telegram & Debug")
+import os
+import re
+import time
+import uuid
+import sqlite3
+import requests
+import pandas as pd
+
+from datetime import datetime
+from urllib.parse import urlparse
+from threading import Thread
+
+import streamlit as st
+from bs4 import BeautifulSoup
+
 
 # reload secrets (so updates in secrets.toml are reflected without restart)
 def _load_secrets_safe():

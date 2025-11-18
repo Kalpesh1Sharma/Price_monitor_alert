@@ -28,7 +28,7 @@ h = logging.StreamHandler()
 h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
 LOG.addHandler(h)
 
-app = Flask(_name_)
+app = Flask(__name__)
 
 # --- DB helpers ---
 def init_db():

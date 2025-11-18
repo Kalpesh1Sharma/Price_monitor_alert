@@ -6,6 +6,7 @@ import uuid
 import requests
 import os
 import pandas as pd
+import json 
 from datetime import datetime
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
@@ -33,36 +34,28 @@ try:
 except Exception:
     pass
 
-# --- Database Path Management ---
+# --- Database Path Management (Omitted for brevity, assume correct) ---
 def get_db_path():
-    """Returns a reliable, absolute path for the SQLite file in the working directory."""
-    # Using os.getcwd() ensures the file is created in a reliable, writable spot.
-    return os.path.join(os.getcwd(), "prices.db") 
+    return os.path.join("/tmp", "prices.db") 
 
 def get_db_connection():
-    """Returns a new SQLite connection using the reliable path."""
     conn = sqlite3.connect(get_db_path(), check_same_thread=False) 
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initializes DB, handles corruption by deleting/recreating the file."""
     db_path = get_db_path()
     
-    # 1. Check for Corruption/Locking on existing file
     if os.path.exists(db_path):
         try:
             with DB_LOCK:
                 conn = get_db_connection()
-                # Simple check to see if the main table exists and is readable
                 conn.execute("SELECT name FROM items LIMIT 1").fetchone()
                 conn.close()
         except Exception:
-            # If the database file is locked or corrupt, delete it to force a clean start.
             print("DB file found but appears corrupted/locked. Deleting and recreating.")
             os.remove(db_path)
             
-    # 2. Create the tables (or ensure they exist)
     try:
         with DB_LOCK:
             conn = get_db_connection()
@@ -73,7 +66,6 @@ def init_db():
             c.execute('''CREATE TABLE IF NOT EXISTS prices 
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, checked_at REAL, price REAL, status TEXT)''')
             
-            # Use 'ALTER TABLE ADD COLUMN IF NOT EXISTS' for safe migration
             c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS target_price REAL DEFAULT 0')
             c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS last_alert_at REAL DEFAULT 0')
             
@@ -82,7 +74,7 @@ def init_db():
     except Exception as e:
         print(f"FATAL: Database Initialization Failed: {e}")
 
-# --- Scraping & Telegram Logic ---
+# --- Scraping Logic (Omitted for brevity, assume correct) ---
 
 def get_random_headers():
     try:
@@ -101,7 +93,6 @@ def parse_price_amazon(soup):
     try:
         price_element = soup.select_one('.a-price-whole')
         if price_element:
-            # Remove comma and dot for clean float conversion
             return float(price_element.text.replace(',', '').replace('.', ''))
         price_element = soup.select_one('.a-offscreen')
         if price_element:
@@ -123,7 +114,6 @@ def fetch_price_data(url):
         if "amazon" in url:
             price = parse_price_amazon(soup)
         else:
-            # Generic Fallback
             import re
             text = soup.get_text()
             matches = re.findall(r'[₹$]\s?([\d,]+)', text)
@@ -134,42 +124,58 @@ def fetch_price_data(url):
     except Exception as e:
         return None, f"Request Error: {e}"
 
+# --- Telegram Fix (Critical Update) ---
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False, "No Config"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    
+    # Use explicit JSON payload and HTML parse mode
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": text, 
+        "parse_mode": "HTML", # <--- FIX APPLIED HERE
+        "disable_web_page_preview": True 
+    }
+    
     try:
-        requests.post(url, json=payload, timeout=10)
-        return True, "Sent"
+        headers = {'Content-Type': 'application/json'}
+        r = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+        
+        if r.status_code == 200:
+            return True, "Sent"
+        else:
+            # Return the full API error message for ultimate debugging
+            print(f"Telegram API Failed: {r.status_code} - Response: {r.text}")
+            return False, f"API Error {r.status_code}: {r.text}"
+            
     except Exception as e:
         return False, str(e)
+# ----------------------------------------
 
 # --- Worker Logic ---
 def check_item_logic(item_id, name, url, target_price, last_alert):
     price, status = fetch_price_data(url)
     now = time.time()
     
-    # Database Write/Commit (Must use lock!)
     conn = get_db_connection()
     try:
         with DB_LOCK:
-            # 1. Insert Price Snapshot
             conn.execute('INSERT INTO prices (item_id, checked_at, price, status) VALUES (?,?,?,?)',
                          (item_id, now, price if price else -1, status))
             
-            # 2. Alerting Logic
             if price and price > 0 and target_price > 0 and price <= target_price:
                 if (now - last_alert) > ALERT_COOLDOWN:
-                    msg = f"🚨 **DEAL ALERT!**\n\n📦 {name}\n💰 **Current:** ₹{price}\n🎯 **Target:** ₹{target_price}\n\n[Link]({url})"
+                    # Message uses HTML tags <b> for bold
+                    msg = f"🚨 <b>DEAL ALERT!</b>\n\n📦 {name}\n💰 <b>Current:</b> ₹{price:.2f}\n🎯 <b>Target:</b> ₹{target_price:.2f}\n\n<a href='{url}'>Product Link</a>"
+                    
                     success, err = send_telegram_message(msg)
                     if success:
                         conn.execute('UPDATE items SET last_alert_at = ? WHERE id = ?', (now, item_id))
                     else:
-                        print(f"Alert failed for {name}: {err}")
+                        print(f"Alert failed for {name}: {err}") 
             
             conn.commit()
     except Exception as e:
-        # Critical write error
         print(f"DB Write Error in Poller for {name}: {e}")
     finally:
         conn.close()
@@ -181,7 +187,6 @@ def start_poller():
     def run():
         while True:
             try:
-                # Read items (must use lock as well)
                 with DB_LOCK:
                     conn = get_db_connection()
                     conn.row_factory = sqlite3.Row
@@ -190,7 +195,7 @@ def start_poller():
                 
                 for row in items:
                     check_item_logic(row['id'], row['name'], row['url'], row['target_price'], row['last_alert_at'])
-                    time.sleep(10) # Wait between items
+                    time.sleep(10) 
             except Exception as e:
                 print(f"Poller Loop Failed: {e}")
                 
@@ -219,7 +224,6 @@ def main():
                 if url:
                     item_name = name or url[:30]
                     try:
-                        # Manual Item Insert (Must use lock!)
                         with DB_LOCK:
                             conn = get_db_connection()
                             uid = str(uuid.uuid4())
@@ -242,7 +246,6 @@ def main():
     # --- Dashboard Data Loading ---
     df = pd.DataFrame()
     try:
-        # Load data (Must use lock!)
         with DB_LOCK:
             conn = get_db_connection()
             df = pd.read_sql('''
@@ -256,10 +259,9 @@ def main():
             ''', conn)
             conn.close()
     except Exception as e:
-        # If the app fails to read, it's a critical DB error or the file is newly deleted/empty.
         print(f"Main data load failed: {e}")
         st.warning("Database is initializing or empty. Add an item to start.")
-        df = pd.DataFrame() # Ensure DataFrame is empty if read fails
+        df = pd.DataFrame() 
 
     # --- Display ---
     if not df.empty:
@@ -267,19 +269,32 @@ def main():
             price = row['current_price']
             target = row['target_price']
             status = row['status'] if row['status'] else "Pending"
+            last_checked_ts = row['checked_at']
             
-            # Status display logic
-            if status != "Success" or not price:
+            # 1. Safely determine display values and status
+            if price is None or price <= 0:
+                price_display = "Pending/Error"
                 icon = "⚠️"
-                lbl = f"Status: {status}"
-            elif price <= target and target > 0:
-                icon = "🔥"
-                lbl = f"DEAL! (₹{price})"
+                lbl = "Status: Pending"
             else:
-                icon = "📈"
-                lbl = f"Current: ₹{price}"
+                price_display = f"₹{price:.2f}"
+                if price <= target and target > 0:
+                    icon = "🔥"
+                    lbl = f"DEAL! ({price_display})"
+                else:
+                    icon = "📈"
+                    lbl = f"Current: {price_display}"
+            
+            last_checked_str = datetime.fromtimestamp(last_checked_ts).strftime('%Y-%m-%d %H:%M') if last_checked_ts else 'Never'
 
-            with st.expander(f"{icon} {lbl} | Target: ₹{target} | {row['url'][:40]}...", expanded=True):
+            # 2. Expander Display (Using the safe strings)
+            with st.expander(f"{icon} {lbl} | Target: ₹{target:.2f} | {row['url'][:40]}...", expanded=True):
+                
+                # --- Price and Status ---
+                st.markdown(f"**Current Price:** {price_display} (Checked: {last_checked_str})")
+                st.markdown(f"**Target Price:** ₹{target:.2f}")
+                st.markdown(f"**Status:** {status}")
+                
                 c1, c2 = st.columns(2)
                 c1.markdown(f"[Link]({row['url']})")
                 

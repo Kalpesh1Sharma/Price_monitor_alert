@@ -15,24 +15,32 @@ DB_FILE = "prices.db"
 POLL_INTERVAL = 1800 
 ALERT_COOLDOWN = 43200 
 
-# --- SECRETS MANAGEMENT (CRASH-PROOF FIX) ---
-# 1. Try Environment Variables (Render/System)
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# --- SECRETS MANAGEMENT (CRASH-PROOF) ---
+TELEGRAM_BOT_TOKEN = None
+TELEGRAM_CHAT_ID = None
 
-# 2. If not found, try Streamlit Secrets (Streamlit Cloud) safely
-if not TELEGRAM_BOT_TOKEN:
-    try:
-        # This access method prevents the "SecretNotFoundError" crash
+try:
+    # 1. Try Environment Variables (Render/System)
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+    # 2. If not found, try Streamlit Secrets (Cloud)
+    # We wrap this in a try-block so a missing/bad file NEVER crashes the app
+    if not TELEGRAM_BOT_TOKEN:
+        # accessing st.secrets triggers the file load
         if "telegram_bot_token" in st.secrets:
             TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
         if "telegram_chat_id" in st.secrets:
             TELEGRAM_CHAT_ID = st.secrets["telegram_chat_id"]
-    except FileNotFoundError:
-        # No secrets file found? No problem, just continue without Telegram.
-        pass
-    except Exception:
-        pass
+
+except Exception as e:
+    # If secrets are corrupt, missing, or invalid, we just print the error and move on.
+    print(f"⚠️ Secrets loading error (App will run without Telegram): {e}")
+    TELEGRAM_BOT_TOKEN = None
+    TELEGRAM_CHAT_ID = None
+
+# --- REST OF THE APP BELOW (Database, Functions, etc.) ---
+# ... (Paste the rest of your existing code here)
 
 # Note: The rest of your code (def get_db_connection...) stays exactly the same.
 

@@ -12,15 +12,31 @@ from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
 DB_FILE = "prices.db"
-# Check more frequently (every 30 mins) so we don't sleep too long, 
-# but not so fast we get banned.
 POLL_INTERVAL = 1800 
-ALERT_COOLDOWN = 43200 # 12 Hours
+ALERT_COOLDOWN = 43200 
 
-# --- SECRETS (Render Compatible) ---
-# On Render, we read from os.environ. On Local, we try st.secrets
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or st.secrets.get("telegram_bot_token")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or st.secrets.get("telegram_chat_id")
+# --- SECRETS MANAGEMENT (CRASH-PROOF FIX) ---
+# 1. Try Environment Variables (Render/System)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# 2. If not found, try Streamlit Secrets (Streamlit Cloud) safely
+if not TELEGRAM_BOT_TOKEN:
+    try:
+        # This access method prevents the "SecretNotFoundError" crash
+        if "telegram_bot_token" in st.secrets:
+            TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
+        if "telegram_chat_id" in st.secrets:
+            TELEGRAM_CHAT_ID = st.secrets["telegram_chat_id"]
+    except FileNotFoundError:
+        # No secrets file found? No problem, just continue without Telegram.
+        pass
+    except Exception:
+        pass
+
+# Note: The rest of your code (def get_db_connection...) stays exactly the same.
+
+# --- CONFIGURATION ---
 
 # --- Database ---
 def get_db_connection():

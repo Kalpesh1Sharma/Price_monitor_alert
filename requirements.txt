@@ -6,4 +6,5 @@ python-dotenv
 pandas
 beautifulsoup4
 lxml
+python-dotenv
 

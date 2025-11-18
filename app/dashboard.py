@@ -1,221 +1,238 @@
-import streamlit as st
-import sqlite3
-import time
-import threading
-import uuid
-import requests
+# app/dashboard.py
+# Safe, robust Streamlit dashboard for price check + simple tracking (SQLite).
+# Paste this whole file and redeploy.
+
 import re
-import pandas as pd
-from datetime import datetime
+import os
+import sqlite3
+from urllib.parse import urlparse
 
-# --- Config ---
-DB_FILE = "prices.db"
-POLL_INTERVAL = 300  # Check every 5 minutes
+import requests
+from bs4 import BeautifulSoup
+import streamlit as st
 
-# --- Database Functions ---
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# -----------------------
+# CONFIG
+# -----------------------
+st.set_page_config(page_title="Price Monitor", layout="centered")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+# DB file (use env var if provided)
+DB_PATH = os.environ.get("TRACKER_DB", "tracked.db")
+REQUEST_TIMEOUT = 12  # seconds
 
-def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('PRAGMA journal_mode=WAL;') # Better concurrency
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            url TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS prices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id TEXT,
-            checked_at REAL,
-            price REAL,
-            raw_text TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def add_item(name, url):
-    conn = get_db_connection()
-    item_id = str(uuid.uuid4())
-    conn.execute('INSERT INTO items (id, name, url) VALUES (?,?,?)', (item_id, name, url))
-    conn.commit()
-    conn.close()
-    # Trigger immediate fetch
-    fetch_price(item_id, url)
-    return item_id
-
-def get_all_items_with_latest_price():
-    conn = get_db_connection()
-    # Complex query to get items + their most recent price
-    query = '''
-        SELECT i.id, i.name, i.url, p.price, p.checked_at 
-        FROM items i
-        LEFT JOIN (
-            SELECT item_id, price, checked_at
-            FROM prices
-            WHERE id IN (SELECT MAX(id) FROM prices GROUP BY item_id)
-        ) p ON i.id = p.item_id
-    '''
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
-
-def get_history(item_id):
-    conn = get_db_connection()
-    df = pd.read_sql('SELECT checked_at, price FROM prices WHERE item_id=? ORDER BY checked_at ASC', 
-                     conn, params=(item_id,))
-    conn.close()
-    if not df.empty:
-        # Convert timestamp to readable date
-        df['date'] = pd.to_datetime(df['checked_at'], unit='s')
-    return df
-
-# --- Scraping Logic ---
-def extract_price(text):
-    # Simple heuristic: remove html tags, look for numbers
-    # Note: For production, use BeautifulSoup
-    clean_text = re.sub(r'<[^>]+>', ' ', text) 
-    matches = re.findall(r'([₹$€£]?\s?[\d,]+\.?\d{0,2})', clean_text)
-    
-    for m in matches:
-        cleaned = re.sub(r'[^\d.]', '', m)
-        if cleaned:
-            try:
-                return float(cleaned)
-            except:
-                continue
-    return None
-
-def fetch_price(item_id, url):
+# -----------------------
+# HELPERS / SCRAPERS (defined before UI)
+# -----------------------
+def parse_price_string(price_str: str):
+    """Return float or None from strings like '₹ 12,345.00' or '12,345'."""
+    if not price_str:
+        return None
+    cleaned = re.sub(r"[^\d.,]", "", price_str).strip()
+    if "." in cleaned and "," in cleaned:
+        # assume commas are thousand separators
+        cleaned = cleaned.replace(",", "")
+    cleaned = cleaned.replace(",", "")
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        price = extract_price(r.text)
-        
-        conn = get_db_connection()
-        conn.execute('INSERT INTO prices (item_id, checked_at, price, raw_text) VALUES (?,?,?,?)',
-                     (item_id, time.time(), price if price else -1, "fetched"))
-        conn.commit()
-        conn.close()
+        return float(cleaned)
+    except Exception:
+        return None
+
+def get_amazon_data(html):
+    soup = BeautifulSoup(html, "lxml")
+    title_el = soup.select_one("#productTitle")
+    title = title_el.get_text(strip=True) if title_el else None
+
+    price_selectors = [
+        "#priceblock_ourprice",
+        "#priceblock_dealprice",
+        "#priceblock_saleprice",
+        "span.a-price > span.a-offscreen",
+    ]
+    price_text = None
+    for sel in price_selectors:
+        el = soup.select_one(sel)
+        if el:
+            price_text = el.get_text(strip=True)
+            break
+
+    img_el = soup.select_one("#landingImage") or soup.select_one("#imgTagWrapperId img")
+    img = img_el.get("src") if img_el and img_el.has_attr("src") else None
+
+    return title, price_text, img
+
+def get_flipkart_data(html):
+    soup = BeautifulSoup(html, "lxml")
+    title_el = soup.select_one("span.B_NuCI") or soup.select_one("._35KyD6")
+    title = title_el.get_text(strip=True) if title_el else None
+
+    price_el = soup.select_one("div._30jeq3._16Jk6d") or soup.select_one("div._30jeq3")
+    price_text = price_el.get_text(strip=True) if price_el else None
+
+    img_el = soup.select_one("img._2r_T1I") or soup.select_one("img._396cs4")
+    img = img_el.get("src") if img_el and img_el.has_attr("src") else None
+
+    return title, price_text, img
+
+def fetch_product(url: str):
+    """
+    Safe fetch wrapper. Returns (title, price_float_or_None, img_url_or_None, raw_price_text_or_None, error_or_None)
+    """
+    if not url or not url.startswith("http"):
+        return None, None, None, None, "Please provide a full URL (starting with http/https)."
+
+    domain = urlparse(url).netloc.lower()
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
     except Exception as e:
-        print(f"Error fetching {url}: {e}")
+        return None, None, None, None, f"Request error: {e}"
 
-# --- Background Worker (The Magic Part) ---
-# @st.cache_resource ensures this runs only ONCE when the server starts
-# and stays alive across user reloads.
-@st.cache_resource
-def start_background_poller():
-    def poll_loop():
-        while True:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            items = conn.execute('SELECT id, url FROM items').fetchall()
-            conn.close()
-            
-            for item_id, url in items:
-                fetch_price(item_id, url)
-                
-            time.sleep(POLL_INTERVAL)
+    html = r.text
 
-    # Daemon thread dies when the main program exits
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-    return t
+    try:
+        if "amazon." in domain:
+            title, raw_price, img = get_amazon_data(html)
+        elif "flipkart." in domain:
+            title, raw_price, img = get_flipkart_data(html)
+        else:
+            soup = BeautifulSoup(html, "lxml")
+            t = soup.select_one("meta[property='og:title']") or soup.select_one("title")
+            title = t.get("content") if (t and t.has_attr("content")) else (t.get_text() if t else None)
+            p = soup.select_one("meta[property='product:price:amount']") or soup.select_one("[class*='price']")
+            raw_price = p.get("content") if (p and p.has_attr("content")) else (p.get_text() if p else None)
+            img_tag = soup.select_one("meta[property='og:image']")
+            img = img_tag.get("content") if (img_tag and img_tag.has_attr("content")) else None
+    except Exception as e:
+        return None, None, None, None, f"Parsing error: {e}"
 
-# --- Main UI ---
-def main():
-    st.set_page_config(page_title="Price Tracker", layout="wide")
-    init_db()
-    
-    # Start the background thread (singleton)
-    start_background_poller()
+    price = parse_price_string(raw_price) if raw_price else None
+    return title, price, img, raw_price, None
 
-    st.title("🛒 Live Price Tracker")
+# -----------------------
+# SQLITE DB HELPERS
+# -----------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS tracked_products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL,
+        title TEXT,
+        target_price REAL,
+        last_price REAL,
+        last_checked TIMESTAMP
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-    # Sidebar: Add New Item
-    with st.sidebar:
-        st.header("Track New Item")
-        with st.form("add_form"):
-            new_name = st.text_input("Item Name")
-            new_url = st.text_input("URL")
-            submitted = st.form_submit_button("Start Tracking")
-            
-            if submitted and new_url:
-                add_item(new_name, new_url)
-                st.success(f"Added {new_name}!")
-                time.sleep(1)
-                st.rerun()
+def add_tracked_product(url, title, target_price, last_price=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO tracked_products (url, title, target_price, last_price, last_checked) VALUES (?, ?, ?, ?, ?)",
+        (url, title, target_price, last_price, None),
+    )
+    conn.commit()
+    conn.close()
 
-    # Main Content: Dashboard
-    df = get_all_items_with_latest_price()
+def list_tracked_products():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, url, title, target_price, last_price, last_checked FROM tracked_products ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
-    if df.empty:
-        st.info("No items tracked yet. Add one in the sidebar!")
+def delete_tracked_product(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM tracked_products WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+# Initialize DB quickly (fast operation)
+init_db()
+
+# -----------------------
+# STREAMLIT UI
+# -----------------------
+st.title("🔎 Price Checker & Tracker")
+
+# small health check visible at top so blank-screen issues are obvious
+st.markdown("*Health:* App loaded. If you see nothing below, check logs.")
+
+col1, col2 = st.columns([8,2])
+with col1:
+    url = st.text_input("Product URL", placeholder="https://www.amazon.in/... or https://www.flipkart.com/...")
+with col2:
+    st.write("")  # spacer
+
+target_price_str = st.text_input("Target price (₹) — numbers only", value="")
+check_now = st.button("Check price")
+track_now = st.button("Track this product")
+
+# Check Price handler (only runs on button click)
+if check_now:
+    with st.spinner("Fetching product... (this runs once)"):
+        title, price, img, raw_price_text, error = fetch_product(url)
+    if error:
+        st.error(error)
     else:
-        # 1. Overview Metrics
-        col1, col2 = st.columns(2)
-        col1.metric("Items Tracked", len(df))
-        avg_price = df[df['price'] > 0]['price'].mean()
-        col2.metric("Avg Price", f"${avg_price:.2f}" if not pd.isna(avg_price) else "-")
+        if title:
+            st.subheader(title)
+        if img:
+            try:
+                st.image(img, width=320)
+            except Exception:
+                st.write("Image found but failed to display.")
+        if price is not None:
+            st.metric(label="Current price (approx.)", value=f"₹ {price:,.2f}")
+            st.write("Raw extracted price text:", raw_price_text)
+        else:
+            st.warning("Price not detected automatically. Raw text (if any):")
+            st.write(raw_price_text)
 
-        st.divider()
-
-        # 2. Main Data Table
-        st.subheader("Current Prices")
-        
-        # Formatting for display
-        display_df = df.copy()
-        display_df['price'] = display_df['price'].apply(lambda x: f"${x:.2f}" if x > 0 else "Error/N/A")
-        display_df['last_checked'] = pd.to_datetime(display_df['checked_at'], unit='s').dt.strftime('%Y-%m-%d %H:%M')
-        
-        st.dataframe(
-            display_df[['name', 'price', 'last_checked', 'url']],
-            use_container_width=True,
-            column_config={
-                "url": st.column_config.LinkColumn("Link"),
-            }
-        )
-
-        st.divider()
-
-        # 3. Drill Down (Charts)
-        st.subheader("Price History Analysis")
-        selected_item_name = st.selectbox("Select Item to View History", df['name'].unique())
-        
-        if selected_item_name:
-            # Get ID for the name
-            item_row = df[df['name'] == selected_item_name].iloc[0]
-            hist_df = get_history(item_row['id'])
-            
-            if not hist_df.empty:
-                # Clean -1 errors for the chart
-                chart_df = hist_df[hist_df['price'] > 0]
-                
-                if not chart_df.empty:
-                    st.line_chart(chart_df, x='date', y='price')
-                    
-                    min_price = chart_df['price'].min()
-                    max_price = chart_df['price'].max()
-                    curr_price = chart_df.iloc[-1]['price']
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Lowest Price", f"${min_price}")
-                    c2.metric("Highest Price", f"${max_price}")
-                    c3.metric("Current", f"${curr_price}")
-                else:
-                    st.warning("Price data contains errors (scraped -1). Check the URL.")
+# Track handler (stores in SQLite)
+if track_now:
+    if not url:
+        st.error("Paste a product URL first.")
+    else:
+        with st.spinner("Fetching product to save..."):
+            title, price, img, raw_price_text, error = fetch_product(url)
+        if error:
+            st.error(f"Cannot fetch product: {error}")
+        else:
+            # validate target price
+            try:
+                tp = float(target_price_str.replace(",", "").strip())
+            except Exception:
+                st.error("Enter a valid target price — numbers only, e.g., 1299.50")
             else:
-                st.write("No history yet.")
+                add_tracked_product(url, title or "", tp, price)
+                st.success(f"Saved tracking: {title or url}\nTarget: ₹ {tp:,.2f}")
 
-        # Manual Refresh Button
-        if st.button("Refresh Data Now"):
-            st.rerun()
+st.markdown("---")
+st.header("Active tracked products")
+rows = list_tracked_products()
+if not rows:
+    st.info("No products tracked yet. Add one above.")
+else:
+    for r in rows:
+        item_id, r_url, r_title, r_target, r_last_price, r_last_checked = r
+        st.write(f"{r_title or r_url}")
+        st.write(r_url)
+        st.write(f"Target: ₹ {r_target:,.2f} — Last price: {('₹ %.2f' % r_last_price) if r_last_price else 'N/A'}")
+        if st.button("Delete", key=f"del-{item_id}"):
+            delete_tracked_product(item_id)
+            st.experimental_rerun()
 
-if __name__ == "__main__":
-    main()
+st.caption("Tip: The background tracker scripts/tracker.py handles periodic checks & Telegram notifications. This UI only adds/removes tracked items.")

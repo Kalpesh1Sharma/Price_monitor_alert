@@ -162,4 +162,118 @@ def start_background_poller():
                 for row in items:
                     fetch_and_analyze(row['id'], row['url'], row['name'], row['target_price'], row['last_alert_at'])
                     time.sleep(2)
-            except
+            except Exception:
+                pass
+            finally:
+                conn.close()
+            time.sleep(POLL_INTERVAL)
+            
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+    return t
+
+# --- UI Helpers ---
+def pretty_time(ts):
+    if not ts or pd.isna(ts): return "Never"
+    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+
+# --- Main Streamlit App ---
+def main():
+    st.set_page_config(page_title="INR Price Tracker", layout="wide")
+    init_db()
+    start_background_poller()
+
+    st.title("🇮🇳 INR Price Monitor & Alerts")
+
+    # --- Sidebar ---
+    st.sidebar.header("Add New Tracker")
+    with st.sidebar.form("add_form", clear_on_submit=True):
+        name = st.text_input("Product Name")
+        url = st.text_input("URL")
+        # Changed label to INR
+        target = st.number_input("Target Price (₹)", min_value=0.0, step=100.0)
+        
+        submitted = st.form_submit_button("Start Tracking")
+        if submitted:
+            if not url:
+                st.warning("URL is required")
+            else:
+                add_item_logic(url, name, target)
+                st.success("Added! Fetching initial price...")
+                time.sleep(1)
+                st.rerun()
+
+    # --- Top Stats ---
+    df = get_dashboard_data()
+    if not df.empty:
+        deals = df[(df['price'] > 0) & (df['price'] <= df['target_price']) & (df['target_price'] > 0)]
+        if not deals.empty:
+            st.success(f"🎉 **{len(deals)} items are currently below your target price!**")
+
+    # --- Data Display ---
+    st.subheader("Your Watchlist")
+
+    if df.empty:
+        st.info("No items yet. Add one in the sidebar.")
+    else:
+        for index, row in df.iterrows():
+            item_id = row['id']
+            name = row['name']
+            url = row['url']
+            price = row['price']
+            target = row['target_price']
+            last_checked = row['checked_at']
+
+            # Logic for status
+            status_emoji = "⚪"
+            
+            if price and price > 0:
+                if target > 0 and price <= target:
+                    status_emoji = "🟢 DEAL"
+                elif target > 0:
+                    status_emoji = "🔴 HIGH"
+            
+            # Formatted with ₹ and commas
+            price_fmt = f"₹{price:,.2f}" if price and price > 0 else "Wait..."
+            target_fmt = f"₹{target:,.2f}" if target > 0 else "No Target"
+
+            header = f"{status_emoji} **{name}** | Current: **{price_fmt}** (Target: {target_fmt})"
+            
+            with st.expander(header, expanded=False):
+                c1, c2 = st.columns([1, 2])
+                
+                with c1:
+                    st.markdown(f"**URL:** [Link]({url})")
+                    st.markdown(f"**Last Checked:** {pretty_time(last_checked)}")
+                    
+                    # Update Target Form
+                    with st.form(key=f"upd_{item_id}"):
+                        new_target = st.number_input("Update Target (₹)", value=float(target))
+                        if st.form_submit_button("Update"):
+                            conn = get_db_connection()
+                            conn.execute("UPDATE items SET target_price = ? WHERE id = ?", (new_target, item_id))
+                            conn.commit()
+                            conn.close()
+                            st.rerun()
+                    
+                    if st.button("Delete", key=f"del_{item_id}"):
+                        conn = get_db_connection()
+                        conn.execute("DELETE FROM items WHERE id=?", (item_id,))
+                        conn.execute("DELETE FROM prices WHERE item_id=?", (item_id,))
+                        conn.commit()
+                        conn.close()
+                        st.rerun()
+
+                with c2:
+                    hist = get_item_history(item_id)
+                    if not hist.empty:
+                        chart_data = hist[hist['price'] > 0].copy()
+                        if not chart_data.empty:
+                            chart_data['date'] = pd.to_datetime(chart_data['checked_at'], unit='s')
+                            st.line_chart(chart_data, x='date', y='price', height=200)
+                            st.caption(f"Lowest recorded: ₹{chart_data['price'].min():,.2f}")
+                    else:
+                        st.write("No history yet.")
+
+if __name__ == "__main__":
+    main()

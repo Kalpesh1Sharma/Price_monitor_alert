@@ -13,10 +13,23 @@ DB_FILE = "prices.db"
 POLL_INTERVAL = 300  # Check every 5 minutes
 ALERT_COOLDOWN = 86400 # 24 Hours before alerting again for the same item
 
-# --- TELEGRAM CONFIG ---
-# Replace with your details
-TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
+# --- SECRETS MANAGEMENT ---
+# We try to load from secrets, or return None if not found to prevent crashing
+try:
+    TELEGRAM_BOT_TOKEN = st.secrets["telegram_bot_token"]
     TELEGRAM_CHAT_ID = st.secrets["telegram_chat_id"]
+except FileNotFoundError:
+    # This happens if you haven't created the .streamlit/secrets.toml file yet
+    TELEGRAM_BOT_TOKEN = None
+    TELEGRAM_CHAT_ID = None
+    st.error("Secrets not found! Please create .streamlit/secrets.toml")
+except KeyError:
+    # This happens if the file exists but the keys are wrong
+    TELEGRAM_BOT_TOKEN = None
+    TELEGRAM_CHAT_ID = None
+    st.error("Secrets found, but Telegram keys are missing.")
+
+# --- Rest of your code (DB Engine, etc.) ---
 
 # --- Database Engine ---
 def get_db_connection():

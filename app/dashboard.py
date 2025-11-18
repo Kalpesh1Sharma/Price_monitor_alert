@@ -1,31 +1,69 @@
+# --- Telegram & debug panel (paste inside your Streamlit app) ---
 st.markdown("---")
 st.header("🔧 Telegram & Debug")
 
-st.write("Bot token set?:", bool(TELEGRAM_BOT_TOKEN))
-st.write("Chat id set?:", bool(TELEGRAM_CHAT_ID))
+# reload secrets (so updates in secrets.toml are reflected without restart)
+def _load_secrets_safe():
+    try:
+        bot = st.secrets.get("telegram_bot_token") or st.secrets.get("TELEGRAM_BOT_TOKEN")
+        chat = st.secrets.get("telegram_chat_id") or st.secrets.get("TELEGRAM_CHAT_ID")
+    except Exception:
+        bot, chat = None, None
+    if chat is not None:
+        chat = str(chat)
+    return bot, chat
 
+BOT, CHAT = _load_secrets_safe()
+
+st.write("Bot token present?:", bool(BOT))
+st.write("Chat id present?:", bool(CHAT))
+if BOT:
+    st.write("Bot token starts with:", (BOT[:8] + "..."))
+if CHAT:
+    st.write("Chat id:", CHAT)
+
+# getUpdates button
 if st.button("Test: call getUpdates"):
-    if not TELEGRAM_BOT_TOKEN:
-        st.error("Set TELEGRAM_BOT_TOKEN first")
+    if not BOT:
+        st.error("Set TELEGRAM_BOT_TOKEN (secrets) first")
     else:
         try:
-            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", timeout=8)
-            st.json(r.json())
+            r = requests.get(f"https://api.telegram.org/bot{BOT}/getUpdates", timeout=8)
+            # raise for status so HTTP errors are surfaced
+            try:
+                r.raise_for_status()
+                # try to show pretty JSON, but catch decode errors
+                try:
+                    st.json(r.json())
+                except Exception:
+                    st.write("Response (non-JSON):", r.text[:2000])
+            except requests.HTTPError as he:
+                # Show full response text for debugging
+                st.error(f"HTTP error: {he}")
+                st.write("Response body:", r.text[:2000])
         except Exception as e:
             st.error(f"getUpdates failed: {e}")
 
+# Send test message
 test_msg = st.text_input("Test message text", value="Hello from app (test)")
 if st.button("Send test Telegram message"):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        st.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    BOT, CHAT = _load_secrets_safe()  # reload in case secrets changed
+    if not (BOT and CHAT):
+        st.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in secrets.")
     else:
+        payload = {"chat_id": CHAT, "text": test_msg, "parse_mode": "HTML"}
         try:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": test_msg, "parse_mode":"HTML"}
-            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=8)
+            r = requests.post(f"https://api.telegram.org/bot{BOT}/sendMessage", json=payload, timeout=8)
+            # show response status & JSON (or text)
             st.write("Status:", r.status_code)
-            st.json(r.json())
-            if r.status_code == 200 and r.json().get("ok"):
-                st.success("Message sent (check Telegram)")
+            try:
+                st.json(r.json())
+                ok = r.json().get("ok", False)
+            except Exception:
+                st.write("Response text:", r.text[:2000])
+                ok = (r.status_code == 200)
+            if ok:
+                st.success("Message sent (check Telegram).")
             else:
                 st.error("Failed to send. See response above.")
         except Exception as e:
@@ -41,11 +79,12 @@ try:
         st.write("No price records yet.")
     else:
         dfp['time'] = pd.to_datetime(dfp['checked_at'], unit='s')
-        st.dataframe(dfp[['item_id','time','price']])
+        # show a truncated dataframe to avoid overwhelming UI
+        st.dataframe(dfp[['item_id','time','price']].head(50))
 except Exception as e:
     st.write("Error reading prices:", e)
 
-# Show items last_alert_at
+# Show items and last_alert_at
 st.markdown("**Tracked items (last_alert_at):**")
 try:
     conn = get_db_connection()
@@ -54,7 +93,15 @@ try:
     if dfi.empty:
         st.write("No items.")
     else:
-        dfi['last_alert_at_human'] = dfi['last_alert_at'].apply(lambda v: datetime.fromtimestamp(v).strftime('%Y-%m-%d %H:%M') if v and v>0 else "Never")
+        # safely convert last_alert_at to human readable, handling nulls and zeros
+        def _fmt_last(ts):
+            try:
+                if not ts or pd.isna(ts) or float(ts) <= 0:
+                    return "Never"
+                return datetime.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                return "Invalid"
+        dfi['last_alert_at_human'] = dfi['last_alert_at'].apply(_fmt_last)
         st.dataframe(dfi[['id','name','target_price','last_alert_at_human']])
 except Exception as e:
     st.write("Error reading items:", e)

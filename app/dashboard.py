@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
 # --- CRITICAL CONCURRENCY LOCK ---
+# This ensures that only one thread (poller or UI) can access the database file at a time.
 DB_LOCK = threading.Lock()
 
 # --- CONFIGURATION ---
@@ -35,9 +36,9 @@ except Exception:
 
 # --- Database Path Management ---
 def get_db_path():
-    """Returns a reliable, absolute path for the SQLite file in the working directory."""
-    # Using os.getcwd() ensures the file is created in a reliable, writable spot.
-    return os.path.join(os.getcwd(), "prices.db") 
+    """Returns a reliable path for the SQLite file in the OS temporary directory (/tmp)."""
+    # Using /tmp ensures the file is created in a guaranteed writable location on Linux/Cloud systems.
+    return os.path.join("/tmp", "prices.db") 
 
 def get_db_connection():
     """Returns a new SQLite connection using the reliable path."""
@@ -54,7 +55,7 @@ def init_db():
         try:
             with DB_LOCK:
                 conn = get_db_connection()
-                # Simple check to see if the main table exists and is readable
+                # Simple check to see if the main table exists and is readable.
                 conn.execute("SELECT name FROM items LIMIT 1").fetchone()
                 conn.close()
         except Exception:
@@ -73,7 +74,7 @@ def init_db():
             c.execute('''CREATE TABLE IF NOT EXISTS prices 
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, checked_at REAL, price REAL, status TEXT)''')
             
-            # Use 'ALTER TABLE ADD COLUMN IF NOT EXISTS' for safe migration
+            # Safe migration using IF NOT EXISTS
             c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS target_price REAL DEFAULT 0')
             c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS last_alert_at REAL DEFAULT 0')
             
@@ -101,7 +102,6 @@ def parse_price_amazon(soup):
     try:
         price_element = soup.select_one('.a-price-whole')
         if price_element:
-            # Remove comma and dot for clean float conversion
             return float(price_element.text.replace(',', '').replace('.', ''))
         price_element = soup.select_one('.a-offscreen')
         if price_element:
@@ -165,11 +165,10 @@ def check_item_logic(item_id, name, url, target_price, last_alert):
                     if success:
                         conn.execute('UPDATE items SET last_alert_at = ? WHERE id = ?', (now, item_id))
                     else:
-                        print(f"Alert failed for {name}: {err}")
+                        print(f"Alert failed for {name}: {err}") # Log error for debugging
             
             conn.commit()
     except Exception as e:
-        # Critical write error
         print(f"DB Write Error in Poller for {name}: {e}")
     finally:
         conn.close()
@@ -256,10 +255,10 @@ def main():
             ''', conn)
             conn.close()
     except Exception as e:
-        # If the app fails to read, it's a critical DB error or the file is newly deleted/empty.
+        # This catches the initial "no such table" error before init_db runs perfectly
         print(f"Main data load failed: {e}")
         st.warning("Database is initializing or empty. Add an item to start.")
-        df = pd.DataFrame() # Ensure DataFrame is empty if read fails
+        df = pd.DataFrame() 
 
     # --- Display ---
     if not df.empty:
@@ -269,17 +268,25 @@ def main():
             status = row['status'] if row['status'] else "Pending"
             
             # Status display logic
+            last_checked_str = datetime.fromtimestamp(row['checked_at']).strftime('%Y-%m-%d %H:%M') if row['checked_at'] else 'Never'
+
             if status != "Success" or not price:
                 icon = "⚠️"
                 lbl = f"Status: {status}"
             elif price <= target and target > 0:
                 icon = "🔥"
-                lbl = f"DEAL! (₹{price})"
+                lbl = f"DEAL! (₹{price:.2f})"
             else:
                 icon = "📈"
-                lbl = f"Current: ₹{price}"
+                lbl = f"Current: ₹{price:.2f}"
 
-            with st.expander(f"{icon} {lbl} | Target: ₹{target} | {row['url'][:40]}...", expanded=True):
+            with st.expander(f"{icon} {lbl} | Target: ₹{target:.2f} | {row['url'][:40]}...", expanded=True):
+                
+                # --- NEW: Explicit Display of Price/Target ---
+                st.markdown(f"**Current Price:** ₹{price:.2f} (Checked: {last_checked_str})")
+                st.markdown(f"**Target Price:** ₹{target:.2f}")
+                st.markdown(f"**Status:** {status}")
+                
                 c1, c2 = st.columns(2)
                 c1.markdown(f"[Link]({row['url']})")
                 

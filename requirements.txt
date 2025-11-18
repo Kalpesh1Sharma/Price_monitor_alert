@@ -7,4 +7,5 @@ pandas
 beautifulsoup4
 lxml
 python-dotenv
+flask
 

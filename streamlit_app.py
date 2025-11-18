@@ -11,11 +11,9 @@ from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
 # --- CRITICAL CONCURRENCY LOCK ---
-# This ensures that only one thread (poller or UI) can access the database file at a time.
 DB_LOCK = threading.Lock()
 
 # --- CONFIGURATION ---
-DB_FILE = "prices.db"
 POLL_INTERVAL = 1800  # 30 minutes
 ALERT_COOLDOWN = 43200 # 12 hours
 
@@ -35,15 +33,36 @@ try:
 except Exception:
     pass
 
-# --- Database Engine ---
+# --- Database Path Management ---
+def get_db_path():
+    """Returns a reliable, absolute path for the SQLite file in the working directory."""
+    # Using os.getcwd() ensures the file is created in a reliable, writable spot.
+    return os.path.join(os.getcwd(), "prices.db") 
+
 def get_db_connection():
-    # Connection is opened without the lock here, but transactions must use the lock.
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    """Returns a new SQLite connection using the reliable path."""
+    conn = sqlite3.connect(get_db_path(), check_same_thread=False) 
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initializes DB and ensures tables exist."""
+    """Initializes DB, handles corruption by deleting/recreating the file."""
+    db_path = get_db_path()
+    
+    # 1. Check for Corruption/Locking on existing file
+    if os.path.exists(db_path):
+        try:
+            with DB_LOCK:
+                conn = get_db_connection()
+                # Simple check to see if the main table exists and is readable
+                conn.execute("SELECT name FROM items LIMIT 1").fetchone()
+                conn.close()
+        except Exception:
+            # If the database file is locked or corrupt, delete it to force a clean start.
+            print("DB file found but appears corrupted/locked. Deleting and recreating.")
+            os.remove(db_path)
+            
+    # 2. Create the tables (or ensure they exist)
     try:
         with DB_LOCK:
             conn = get_db_connection()
@@ -54,21 +73,17 @@ def init_db():
             c.execute('''CREATE TABLE IF NOT EXISTS prices 
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, checked_at REAL, price REAL, status TEXT)''')
             
-            # Migration safety
-            try:
-                cols = [row[1] for row in c.execute("PRAGMA table_info(items)")]
-                if 'target_price' not in cols: c.execute('ALTER TABLE items ADD COLUMN target_price REAL DEFAULT 0')
-                if 'last_alert_at' not in cols: c.execute('ALTER TABLE items ADD COLUMN last_alert_at REAL DEFAULT 0')
-            except:
-                pass
-                
+            # Use 'ALTER TABLE ADD COLUMN IF NOT EXISTS' for safe migration
+            c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS target_price REAL DEFAULT 0')
+            c.execute('ALTER TABLE items ADD COLUMN IF NOT EXISTS last_alert_at REAL DEFAULT 0')
+            
             conn.commit()
             conn.close()
     except Exception as e:
-        # If DB initialization fails (e.g., bad permissions), log it.
         print(f"FATAL: Database Initialization Failed: {e}")
 
 # --- Scraping & Telegram Logic ---
+
 def get_random_headers():
     try:
         ua = UserAgent()
@@ -86,6 +101,7 @@ def parse_price_amazon(soup):
     try:
         price_element = soup.select_one('.a-price-whole')
         if price_element:
+            # Remove comma and dot for clean float conversion
             return float(price_element.text.replace(',', '').replace('.', ''))
         price_element = soup.select_one('.a-offscreen')
         if price_element:
@@ -107,7 +123,7 @@ def fetch_price_data(url):
         if "amazon" in url:
             price = parse_price_amazon(soup)
         else:
-            # Generic Fallback (Simple regex)
+            # Generic Fallback
             import re
             text = soup.get_text()
             matches = re.findall(r'[₹$]\s?([\d,]+)', text)
@@ -133,6 +149,7 @@ def check_item_logic(item_id, name, url, target_price, last_alert):
     price, status = fetch_price_data(url)
     now = time.time()
     
+    # Database Write/Commit (Must use lock!)
     conn = get_db_connection()
     try:
         with DB_LOCK:
@@ -152,6 +169,7 @@ def check_item_logic(item_id, name, url, target_price, last_alert):
             
             conn.commit()
     except Exception as e:
+        # Critical write error
         print(f"DB Write Error in Poller for {name}: {e}")
     finally:
         conn.close()
@@ -172,7 +190,7 @@ def start_poller():
                 
                 for row in items:
                     check_item_logic(row['id'], row['name'], row['url'], row['target_price'], row['last_alert_at'])
-                    time.sleep(10) # Be polite to the vendor
+                    time.sleep(10) # Wait between items
             except Exception as e:
                 print(f"Poller Loop Failed: {e}")
                 
@@ -199,9 +217,9 @@ def main():
             
             if st.form_submit_button("Track"):
                 if url:
-                    # Logic to insert the new item (Must use lock!)
                     item_name = name or url[:30]
                     try:
+                        # Manual Item Insert (Must use lock!)
                         with DB_LOCK:
                             conn = get_db_connection()
                             uid = str(uuid.uuid4())
@@ -213,7 +231,7 @@ def main():
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Failed to insert item (DB Write Error): {e}") # <-- Shows the explicit error
+                        st.error(f"Failed to insert item (DB Write Error): {e}")
         
         st.divider()
         if st.button("Test Telegram"):
@@ -237,9 +255,11 @@ def main():
                 ) p ON i.id = p.item_id
             ''', conn)
             conn.close()
-    except Exception:
-        # This catches the initial "no such table" error before init_db runs perfectly
-        pass
+    except Exception as e:
+        # If the app fails to read, it's a critical DB error or the file is newly deleted/empty.
+        print(f"Main data load failed: {e}")
+        st.warning("Database is initializing or empty. Add an item to start.")
+        df = pd.DataFrame() # Ensure DataFrame is empty if read fails
 
     # --- Display ---
     if not df.empty:

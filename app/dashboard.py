@@ -6,8 +6,7 @@ import uuid
 import requests
 import os
 import pandas as pd
-import json # New import for explicit JSON handling
-from urllib.parse import quote_plus # New import for URL encoding
+import json 
 from datetime import datetime
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
@@ -35,19 +34,16 @@ try:
 except Exception:
     pass
 
-# --- Database Path Management ---
+# --- Database Path Management (Omitted for brevity, assume correct) ---
 def get_db_path():
-    """Returns a reliable path for the SQLite file in the OS temporary directory (/tmp)."""
     return os.path.join("/tmp", "prices.db") 
 
 def get_db_connection():
-    """Returns a new SQLite connection using the reliable path."""
     conn = sqlite3.connect(get_db_path(), check_same_thread=False) 
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initializes DB, handles corruption by deleting/recreating the file."""
     db_path = get_db_path()
     
     if os.path.exists(db_path):
@@ -78,7 +74,7 @@ def init_db():
     except Exception as e:
         print(f"FATAL: Database Initialization Failed: {e}")
 
-# --- Scraping Logic (omitted for brevity, assume correct) ---
+# --- Scraping Logic (Omitted for brevity, assume correct) ---
 
 def get_random_headers():
     try:
@@ -133,16 +129,15 @@ def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False, "No Config"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # Use explicit JSON payload to avoid encoding issues on cloud hosts
+    # Use explicit JSON payload and HTML parse mode
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": text, 
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True # Added to prevent issues with link previews
+        "parse_mode": "HTML", # <--- FIX APPLIED HERE
+        "disable_web_page_preview": True 
     }
     
     try:
-        # Use data=json.dumps() and set Content-Type header explicitly
         headers = {'Content-Type': 'application/json'}
         r = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
         
@@ -170,8 +165,8 @@ def check_item_logic(item_id, name, url, target_price, last_alert):
             
             if price and price > 0 and target_price > 0 and price <= target_price:
                 if (now - last_alert) > ALERT_COOLDOWN:
-                    # Construct message with safe markdown formatting
-                    msg = f"🚨 **DEAL ALERT!**\n\n📦 {name}\n💰 **Current:** ₹{price:.2f}\n🎯 **Target:** ₹{target_price:.2f}\n\n[Link]({url})"
+                    # Message uses HTML tags <b> for bold
+                    msg = f"🚨 <b>DEAL ALERT!</b>\n\n📦 {name}\n💰 <b>Current:</b> ₹{price:.2f}\n🎯 <b>Target:</b> ₹{target_price:.2f}\n\n<a href='{url}'>Product Link</a>"
                     
                     success, err = send_telegram_message(msg)
                     if success:
@@ -244,7 +239,6 @@ def main():
         
         st.divider()
         if st.button("Test Telegram"):
-            # Use a generic message for the test
             ok, msg = send_telegram_message("✅ Test message from App")
             if ok: st.success("Sent!")
             else: st.error(f"Failed: {msg}")

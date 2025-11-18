@@ -173,7 +173,7 @@ def trigger_fetch(item_id):
     return jsonify({"ok": True}), 202
 
 # --- startup ---
-if _name_ == "_main_":
+if __name__ == "_main_":
     init_db()
     # start poller thread
     t = threading.Thread(target=poller_loop, daemon=True)
